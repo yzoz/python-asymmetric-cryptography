@@ -46,6 +46,13 @@ In `main.py`:
 * `get_rand(b)` — a random integer of `b` bytes (`os.urandom`, or a seeded
   generator for reproducible runs).
 * `gen_prime(b)` — generate a prime of `b` bytes using `trial_division`.
+* `gen_close_primes(b)` — generate two primes of `b` bytes that are close to
+  each other, for the factorization attack.
+* `fermat_factor(n)` — factor `n = p * q` with Fermat's method (uses
+  `bin_sqrt`); fast when the factors are close.
+* `bezout_check(a, b)` — extended `gcd` plus a verification of Bezout's
+  identity (uses `extended_gcd`).
+* `prime_check(n)` — compare `trial_division` with `fermat_test` on one number.
 * `show_stat(...)` — inline progress indicator (debug helper).
 * `text_to_int` / `int_to_text` — convert a string to a message integer and
   back using big-endian UTF-8.
@@ -146,6 +153,36 @@ python3 main.py --m 1234567            # encrypt a numeric message
 * `--bits` — size in bytes of the generated primes;
 * `--m` — numeric message instead of the built-in text.
 
+### Factorization attack
+
+`--attack` generates two deliberately close primes, publishes `N` and `E`,
+then recovers the factors from `N` alone with Fermat's method and rebuilds the
+private exponent `D`:
+
+```
+python3 main.py --attack --seed 42
+```
+
+Fermat's method is fast only when the factors are close, which is why the
+attack uses `gen_close_primes`. `bin_sqrt` supplies both the starting value
+`ceil(sqrt(N))` and the exact perfect-square test for each step.
+
+### Math helpers
+
+`--check` runs one primitive on demand, for inspection or teaching:
+
+```
+python3 main.py --check sqrt   --sqrt-number 12345        # bin_sqrt
+python3 main.py --check bezout --bezout-a 240 --bezout-b 46  # extended_gcd
+python3 main.py --check prime  --prime 561                # trial_division vs fermat_test
+```
+
+* `--check sqrt` — floor/ceiling square root of a number (uses `bin_sqrt`);
+* `--check bezout` — Bezout coefficients and `gcd` of two numbers (uses
+  `extended_gcd`);
+* `--check prime` — deterministic `trial_division` next to probabilistic
+  `fermat_test`, which visibly disagree on a Carmichael number such as `561`.
+
 ## Teaching limitations
 
 This project is intentionally simple and **must not be used for real
@@ -160,6 +197,10 @@ cryptography**:
   purpose, to keep the code readable.
 * Text is encoded as one big integer without padding, so the scheme offers no
   semantic security.
+* **Primes that are too close are factorable.** The `--attack` mode shows that
+  when `p` and `q` are near each other, `N` can be split by Fermat's method in
+  negligible time (a real key must use primes chosen independently and large
+  enough that factoring is infeasible).
 
 ## Tests
 

@@ -8,6 +8,7 @@ fixed parameters so the numbers stay deterministic.
 """
 
 import math
+import random
 import unittest
 
 import crypto_math as cm
@@ -144,6 +145,70 @@ class TestRoundTrip(unittest.TestCase):
     def test_marker_block_is_fixed_point(self):
         # (N - 1) ** E mod N == N - 1 for any odd E.
         self.assertEqual(cm.mod_exp(self.N - 1, self.E, self.N), self.N - 1)
+
+
+class TestFermatFactor(unittest.TestCase):
+    def test_close_primes(self):
+        for p, q in ((61, 53), (101, 103), (9973, 9967)):
+            with self.subTest(p=p, q=q):
+                self.assertEqual(
+                    sorted(main.fermat_factor(p * q)), sorted((p, q))
+                )
+
+    def test_exact_square_is_factorable(self):
+        # N = p * p: Fermat finds it on the first step with b == 0.
+        p = 1009
+        self.assertEqual(sorted(main.fermat_factor(p * p)), [p, p])
+
+    def test_prime_is_rejected(self):
+        with self.assertRaises(ValueError):
+            main.fermat_factor(101)
+
+    def test_far_apart_factors_hit_limit(self):
+        with self.assertRaises(ValueError):
+            main.fermat_factor(3 * 100003, limit=2)
+
+
+class TestGenClosePrimes(unittest.TestCase):
+    def test_primes_are_close_and_valid(self):
+        main._rng = random.Random(1234)
+        try:
+            p, q = main.gen_close_primes(4)
+        finally:
+            main._rng = None
+        self.assertNotEqual(p, q)
+        self.assertTrue(cm.trial_division(p))
+        self.assertTrue(cm.trial_division(q))
+        self.assertLess(min(q - p, p - q), 1000)
+
+    def test_fermat_factor_recovers_generated_primes(self):
+        main._rng = random.Random(99)
+        try:
+            p, q = main.gen_close_primes(4)
+        finally:
+            main._rng = None
+        self.assertEqual(sorted(main.fermat_factor(p * q)), sorted((p, q)))
+
+
+class TestCheckHelpers(unittest.TestCase):
+    def test_bezout_check_identity(self):
+        for a, b in ((240, 46), (17, 3120), (1, 1)):
+            with self.subTest(a=a, b=b):
+                g, x, y, identity = main.bezout_check(a, b)
+                self.assertEqual(g, math.gcd(a, b))
+                self.assertEqual(identity, g)
+
+    def test_prime_check_carmichael(self):
+        deterministic, probabilistic = main.prime_check(561)
+        self.assertFalse(deterministic)
+        self.assertTrue(probabilistic)
+
+
+class TestChooseExponent(unittest.TestCase):
+    def test_smallest_coprime_for_tiny_modulus(self):
+        # M smaller than 65537 forces the fallback smallest odd coprime.
+        self.assertEqual(main.choose_exponent(40), 3)
+        self.assertEqual(math.gcd(3, 40), 1)
 
 
 class TestTextEncoding(unittest.TestCase):
