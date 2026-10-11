@@ -262,8 +262,8 @@ def print_char_table(text, columns=COLUMNS):
     records = char_records(text)
     rows = (len(records) + columns - 1) // columns
 
-    header = '  {:>2}  {}  {:<6}  {}'.format('id', 'ch', 'code', 'hex')
-    divider = '  --  --  ------  ---'
+    header = '  {:>2}  {}   {:<6} {}'.format('id', 'c', 'code', 'hx')
+    divider = '  --  -  ------  --'
     print('   |  '.join([header] * columns))
     print('   |  '.join([divider] * columns))
 
