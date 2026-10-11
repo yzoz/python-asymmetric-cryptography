@@ -28,14 +28,11 @@ from crypto_text import (
     COLUMNS,
     BREAKDOWN_THRESHOLD,
     CATEGORY_ORDER,
-    text_to_int,
-    int_to_text,
     encoding_steps,
     char_records,
     char_categories,
     block_size,
     split_blocks,
-    join_blocks,
 )
 
 # When a seed is supplied this holds a seeded generator so the whole run is
