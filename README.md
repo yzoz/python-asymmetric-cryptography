@@ -285,11 +285,8 @@ prints a readable message (and exits with status 2 for the CLI).
 ```
 python3 main.py --p 4 --q 53        # p is composite
 python3 main.py --p 561 --q 1105    # p is a Carmichael number (fermat_test accepts it)
-python3 main.py --text "$(python3 - <<'PY'
-print('A' * 6000)
-PY
-)"                                  # text whose integer exceeds the int -> str limit
-python3 main.py --m "$(python3 -c "print('1' + '0' * 5000)")"   # huge decimal number
+python3 main.py --text "$(python3 -c 'print("A" * 6000)')"        # text too long for int -> str
+python3 main.py --m "$(python3 -c 'print("1" + "0" * 5000)')"     # huge decimal number
 ```
 
 * **Composite `p` or `q`** (`--p 4`) — `validate_prime` refuses it:
