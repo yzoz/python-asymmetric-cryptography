@@ -58,6 +58,3 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
-
-# Local tooling (semantic-search index)
-.semantic-search

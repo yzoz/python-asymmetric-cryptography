@@ -9,7 +9,10 @@ output paths (text vs numeric).
 
 import io
 import math
+import os
 import random
+import subprocess
+import sys
 import unittest
 from contextlib import redirect_stdout
 
@@ -105,17 +108,96 @@ class TestGenClosePrimes(unittest.TestCase):
 
 
 class TestCheckHelpers(unittest.TestCase):
-    def test_bezout_check_identity(self):
-        for a, b in ((240, 46), (17, 3120), (1, 1)):
+    def test_common_divisor_agree(self):
+        # Both --gcd methods must return the same g.
+        for a, b in ((240, 46), (17, 3120), (1, 1), (61 * 19, 53 * 19)):
             with self.subTest(a=a, b=b):
-                g, x, y, identity = main.bezout_check(a, b)
-                self.assertEqual(g, math.gcd(a, b))
-                self.assertEqual(identity, g)
+                self.assertEqual(
+                    main.common_divisor(a, b, 'euclid'),
+                    main.common_divisor(a, b, 'extended'),
+                )
+                self.assertEqual(main.common_divisor(a, b, 'euclid'),
+                                 math.gcd(a, b))
 
-    def test_prime_check_carmichael(self):
-        deterministic, probabilistic = main.prime_check(561)
-        self.assertFalse(deterministic)
-        self.assertTrue(probabilistic)
+    def test_prime_dispatch(self):
+        for x in (2, 3, 5, 7, 13, 97, 101):
+            with self.subTest(x=x):
+                self.assertTrue(main.is_prime(x, 'trial'))
+                self.assertTrue(main.is_prime(x, 'fermat'))
+        for x in (4, 9, 21, 561):
+            with self.subTest(x=x):
+                self.assertFalse(main.is_prime(x, 'trial'))
+
+
+class TestValidatePrime(unittest.TestCase):
+    def test_accepts_primes(self):
+        for x in (2, 3, 61, 53, 9973):
+            with self.subTest(x=x):
+                main.validate_prime(x, 'p')
+
+    def test_rejects_composite(self):
+        with self.assertRaises(ValueError) as ctx:
+            main.validate_prime(4, 'p')
+        self.assertIn('not a prime', str(ctx.exception))
+
+    def test_rejects_carmichael_by_name(self):
+        with self.assertRaises(ValueError) as ctx:
+            main.validate_prime(561, 'q')
+        self.assertIn('Carmichael', str(ctx.exception))
+        self.assertIn('561', str(ctx.exception))
+
+
+class TestBigInt(unittest.TestCase):
+    def test_short_value_printed_fully(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main.print_big_int('x', 12345)
+        self.assertIn('12345', buf.getvalue())
+
+    def test_long_value_does_not_call_str(self):
+        # A value far beyond the int -> str limit must be summarised, not
+        # converted: the summary is produced without ever calling str(value).
+        value = 10 ** 5000 + 7
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main.print_big_int('x', value)
+        out = buf.getvalue()
+        self.assertIn('decimal digits, skipped', out)
+        self.assertIn('bits =', out)
+        self.assertIn('hex = 0x', out)
+        self.assertIn('(truncated)', out)
+
+    def test_decimal_digits_bounds(self):
+        for value in (0, 1, 9, 10, 99, 10 ** 12):
+            with self.subTest(value=value):
+                self.assertGreaterEqual(main.decimal_digits(value),
+                                        len(str(value)))
+
+
+class TestBlockTruncation(unittest.TestCase):
+    def test_many_blocks_are_truncated(self):
+        p, q = 61, 53  # N = 3233
+        N = p * q
+        E, D = 17, 2753
+        blocks = [bytes([i % 256]) for i in range(60)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            results = main.print_blocks(blocks, E, D, N)
+        out = buf.getvalue()
+        self.assertEqual(len(results), 60)  # computation stays complete
+        self.assertIn('block 0:', out)
+        self.assertIn('block 2:', out)
+        self.assertIn('block 59:', out)
+        self.assertNotIn('block 30:', out)
+        self.assertIn('blocks omitted', out)
+
+    def test_few_blocks_not_truncated(self):
+        blocks = [bytes([i]) for i in range(5)]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main.print_blocks(blocks, 17, 2753, 3233)
+        self.assertIn('block 4:', buf.getvalue())
+        self.assertNotIn('blocks omitted', buf.getvalue())
 
 
 class TestChooseExponent(unittest.TestCase):
@@ -189,6 +271,76 @@ class TestRunPaths(unittest.TestCase):
     def test_numeric_path_keeps_marker(self):
         _, out = self._run(message=12345)
         self.assertIn('marker', out)
+
+    def test_gcd_extended_same_result(self):
+        text = 'Hello, World! 123'
+        r_euclid, out_euclid = self._run(text=text, gcd_method='euclid')
+        r_ext, out_ext = self._run(text=text, gcd_method='extended')
+        self.assertEqual(r_euclid, r_ext)
+        self.assertIn('Bezout', out_ext)
+        self.assertNotIn('Bezout', out_euclid)
+
+    def test_prime_fermat_same_result(self):
+        text = 'Hello, World! 123'
+        r_trial, out_trial = self._run(text=text, prime_method='trial')
+        r_fermat, out_fermat = self._run(text=text, prime_method='fermat')
+        self.assertEqual(r_trial, r_fermat)
+        self.assertIn('Carmichael', out_fermat)
+        self.assertNotIn('Carmichael', out_trial)
+
+    def test_long_text_does_not_crash(self):
+        # A message long enough that its integer exceeds the int -> str limit
+        # must be summarised instead of raising ValueError.
+        text = 'A' * 6000
+        result, out = self._run(text=text)
+        self.assertEqual(result, text)
+        self.assertIn('decimal digits, skipped', out)
+
+    def test_numeric_path_long_message_does_not_crash(self):
+        message = int.from_bytes(b'\xff' * 5000, 'big')
+        result, out = self._run(message=message)
+        self.assertEqual(result, message)
+        self.assertIn('decimal digits, skipped', out)
+
+    def test_composite_p_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            with redirect_stdout(io.StringIO()):
+                main.run(p=4, q=53)
+
+    def test_carmichael_p_raises_named_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            with redirect_stdout(io.StringIO()):
+                main.run(p=561, q=1105)
+        self.assertIn('Carmichael', str(ctx.exception))
+
+
+class TestCliErrors(unittest.TestCase):
+    """The CLI must report edge cases without a traceback and exit with 2."""
+
+    def _cli(self, *argv):
+        proc = subprocess.run(
+            [sys.executable, 'main.py', *argv],
+            capture_output=True, text=True, cwd=os.path.dirname(__file__) or '.',
+        )
+        return proc
+
+    def test_composite_prime_is_reported(self):
+        proc = self._cli('--p', '4', '--q', '53')
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn('Traceback', proc.stderr)
+        self.assertIn('error:', proc.stderr)
+
+    def test_carmichael_prime_is_reported(self):
+        proc = self._cli('--p', '561', '--q', '1105')
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn('Traceback', proc.stderr)
+        self.assertIn('Carmichael', proc.stderr)
+
+    def test_huge_decimal_message_is_reported(self):
+        proc = self._cli('--p', '61', '--q', '53', '--m', '1' + '0' * 5000)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn('Traceback', proc.stderr)
+        self.assertIn('error:', proc.stderr)
 
 
 if __name__ == '__main__':

@@ -39,6 +39,26 @@ from crypto_text import (
 # reproducible; otherwise get_rand draws from the OS entropy source.
 _rng = None
 
+# Number of bases tried by fermat_test. For a composite that is not a
+# Carmichael number the chance of a false "prime" is at most 2 ** -FERMAT_ROUNDS;
+# at the default six-byte primes the whole test costs about a millisecond.
+FERMAT_ROUNDS = 20
+
+# The five smallest Carmichael numbers. They pass fermat_test for every base
+# coprime to them, which is why the probabilistic test cannot be trusted alone.
+CARMICHAEL_EXAMPLES = (561, 1105, 1729, 2465, 2821)
+
+# A decimal rendering longer than this many digits is not printed: Python
+# refuses int -> str beyond sys.get_int_max_str_digits() (4300 by default, and
+# the conversion is quadratic in the digit count). The limit is approached with
+# a safety margin and the value is summarised instead (see print_big_int).
+BIG_INT_DIGITS = 4000
+
+# Block transcript truncation: with more blocks than this, only the first and
+# the last BLOCK_PRINT_EDGE are printed.
+BLOCK_PRINT_LIMIT = 20
+BLOCK_PRINT_EDGE = 3
+
 
 def show_stat(m, i, s=1, h=1):
     """
@@ -66,16 +86,66 @@ def get_rand(b):
     return int.from_bytes(os.urandom(b), byteorder='little')
 
 
-def gen_prime(b=6, certainty=10):
+def is_prime(x, prime_method='trial'):
     """
-    Generate a prime number of b bytes by trial division.
+    Primality dispatcher selected by --prime.
 
-    trial_division is deterministic, so the generated prime is always genuine;
-    the probabilistic fermat_test is intentionally not used here.
+    'trial' uses the deterministic trial_division; 'fermat' uses the
+    probabilistic fermat_test (which accepts Carmichael numbers). It is used
+    only for *generating* candidates: every chosen p and q is re-checked
+    deterministically by validate_prime, so a Fermat false positive can never
+    reach the key material.
+    """
+    if prime_method == 'fermat':
+        return fermat_test(x, FERMAT_ROUNDS)
+    return trial_division(x)
+
+
+def common_divisor(a, b, gcd_method='euclid'):
+    """
+    Greatest common divisor dispatcher selected by --gcd.
+
+    'euclid' uses gcd(); 'extended' uses extended_gcd() and keeps only the
+    shared factor g (the Bezout coefficients are simply ignored here). Both
+    return the same value, so the transcript is identical either way.
+    """
+    if gcd_method == 'extended':
+        return extended_gcd(a, b)[0]
+    return gcd(a, b)
+
+
+def validate_prime(x, name, prime_method='trial'):
+    """
+    Assert that an explicitly supplied p or q is really prime.
+
+    The check is always deterministic (trial_division), even when --prime
+    fermat was selected: otherwise a Fermat false positive such as a Carmichael
+    number would silently produce a broken key. A composite raises ValueError
+    with a readable message; a Carmichael number is called out by name.
+    """
+    if trial_division(x):
+        return
+    if x in CARMICHAEL_EXAMPLES:
+        raise ValueError(
+            f'{name} = {x} is a composite Carmichael number: it passes '
+            f'fermat_test yet is not prime (examples: '
+            f'{", ".join(map(str, CARMICHAEL_EXAMPLES))})'
+        )
+    raise ValueError(f'{name} = {x} is not a prime number')
+
+
+def gen_prime(b=6, prime_method='trial'):
+    """
+    Generate a prime number of b bytes.
+
+    Candidates are tested with the method selected by --prime (trial_division
+    or fermat_test). trial_division is deterministic; fermat_test is faster but
+    probabilistic, so with --prime fermat a candidate may occasionally be a
+    composite - the final key parameters are validated separately.
     """
     x = get_rand(b)
     t = time.time()
-    while not trial_division(x):
+    while not is_prime(x, prime_method):
         x = get_rand(b)
     print(f'  prime found in {time.time() - t:.3f} s')
     return x
@@ -91,7 +161,7 @@ def looks_like_int(s):
     return re.fullmatch(r'[+-]?\d+', s) is not None
 
 
-def gen_close_primes(b=6):
+def gen_close_primes(b=6, prime_method='trial'):
     """
     Return two distinct primes of b bytes that are close to each other.
 
@@ -99,9 +169,9 @@ def gen_close_primes(b=6):
     factors are close, so the attack demonstration draws the second prime
     from the small numbers just above the first.
     """
-    p = gen_prime(b)
+    p = gen_prime(b, prime_method)
     q = p + 2
-    while not trial_division(q):
+    while not is_prime(q, prime_method):
         q += 2
     return p, q
 
@@ -136,7 +206,7 @@ def fermat_factor(n, limit=1 << 20):
     )
 
 
-def choose_exponent(m):
+def choose_exponent(m, gcd_method='euclid'):
     """
     Pick the public exponent E with 1 < E < m and gcd(E, m) == 1.
 
@@ -145,13 +215,14 @@ def choose_exponent(m):
     than 65537, so the smallest suitable odd exponent is chosen instead.
     D = mod_mul_inverse(E, m) is only meaningful when these conditions hold.
 
-    The coprime test is done with the extended algorithm: E * x + m * y == g
-    and a valid exponent needs g == 1, which is exactly Bezout's identity.
+    The coprime test uses the method selected by --gcd; extended_gcd also
+    returns the Bezout coefficients, of which only the shared factor is used
+    here (a valid exponent needs g == 1).
     """
-    if 1 < 65537 < m and extended_gcd(65537, m)[0] == 1:
+    if 1 < 65537 < m and common_divisor(65537, m, gcd_method) == 1:
         return 65537
     e = 3
-    while e < m and extended_gcd(e, m)[0] != 1:
+    while e < m and common_divisor(e, m, gcd_method) != 1:
         e += 2
     if not 1 < e < m:
         raise ValueError(
@@ -212,19 +283,64 @@ def print_char_table(text, columns=COLUMNS):
         print('   |  '.join(cells))
 
 
+def decimal_digits(x):
+    """
+    Upper bound on the number of decimal digits of a non-negative integer.
+
+    Uses the bit length (log10(x) < bit_length(x) * log10(2)) so no decimal
+    conversion is performed. This is what lets print_big_int decide *before*
+    calling str() whether the value is safe to render: the int -> str limit and
+    the quadratic cost are both avoided.
+    """
+    if x < 0:
+        x = -x
+    return x.bit_length() * 30103 // 100000 + 1  # log10(2) ~ 0.30103
+
+
+def print_big_int(label, value, threshold=BIG_INT_DIGITS):
+    """
+    Print an integer, fully when short and as a summary when very long.
+
+    Python refuses to convert a too-long integer to decimal (see the note on
+    BIG_INT_DIGITS), so a long value is summarised instead of crashing: the
+    digit count, the bit length and a truncated hexadecimal form are shown.
+    The decision uses decimal_digits, so str() is never called on a value that
+    would exceed the limit.
+    """
+    if decimal_digits(value) <= threshold:
+        print(f'  {label} = {value}')
+        return
+    digits = decimal_digits(value)
+    hexstr = format(value, 'x')
+    print(f'  {label} = <{digits} decimal digits, skipped>')
+    print(f'           bits = {value.bit_length()}, hex = 0x{hexstr[:32]}... '
+          f'(truncated)')
+    print('           note: full decimal form exceeds the int -> str limit; '
+          'only the hexadecimal prefix is shown')
+
+
 def print_blocks(blocks, E, D, N):
     """
     Encrypt and decrypt one list of byte blocks and print the transcript.
 
     Returns the list of (plain_int, cipher_int, back_int) triples so the
-    caller can rebuild the message and verify the round-trip.
+    caller can rebuild the message and verify the round-trip. When there are
+    more than BLOCK_PRINT_LIMIT blocks only the first and the last
+    BLOCK_PRINT_EDGE are printed (the computation stays complete).
     """
     results = []
+    total = len(blocks)
     for i, block in enumerate(blocks):
         plain = int.from_bytes(block, 'big')
         cipher = mod_exp(plain, E, N)
         back = mod_exp(cipher, D, N)
         results.append((plain, cipher, back))
+        if total > BLOCK_PRINT_LIMIT and not (
+            i < BLOCK_PRINT_EDGE or i >= total - BLOCK_PRINT_EDGE
+        ):
+            if i == BLOCK_PRINT_EDGE:
+                print(f'  ... {total - 2 * BLOCK_PRINT_EDGE} blocks omitted ...')
+            continue
         print(f'  block {i}: plain = {plain}')
         print(f'           cipher = {cipher}')
         print(f'           back   = {back}   ok: {back == plain}')
@@ -232,7 +348,7 @@ def print_blocks(blocks, E, D, N):
 
 
 def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
-        force_text=False):
+        gcd_method='euclid', prime_method='trial'):
     """
     Run one full encryption/decryption demonstration and print the result.
 
@@ -242,6 +358,9 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
       block by block, properly hiding every byte;
     * numeric path (message is an int): the historical single-value scheme
       with the fixed marker block N - 1 is kept.
+
+    gcd_method and prime_method come from --gcd / --prime. A short educational
+    note is printed only when a non-default algorithm was explicitly chosen.
     """
     global _rng
 
@@ -252,10 +371,25 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
     print('  RSA-LIKE PUBLIC-KEY DEMONSTRATION')
     print('=' * 60)
 
+    if gcd_method == 'extended':
+        print('  gcd: extended_gcd also returns the Bezout coefficients '
+              '(g, x, y)')
+        print('       with a*x + b*y = g; the shared factor g is the same as '
+              'gcd returns.')
+    if prime_method == 'fermat':
+        print('  primality: fermat_test is probabilistic and accepts '
+              'Carmichael numbers')
+        print(f'             (e.g. {", ".join(map(str, CARMICHAEL_EXAMPLES))}); '
+              f'p and q are re-checked deterministically anyway.')
+
     print('\n[1] PRIME PARAMETERS')
     if p is None or q is None:
-        p = p if p is not None else gen_prime(bits)
-        q = q if q is not None else gen_prime(bits)
+        p = p if p is not None else gen_prime(bits, prime_method)
+        q = q if q is not None else gen_prime(bits, prime_method)
+    # Always verify deterministically, even with --prime fermat: a probabilistic
+    # false positive must never reach the key material.
+    validate_prime(p, 'p', prime_method)
+    validate_prime(q, 'q', prime_method)
     print(f'  p = {p}')
     print(f'  q = {q}')
 
@@ -264,10 +398,10 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
 
     # Carmichael function: lambda(N) is the exponent of the multiplicative
     # group modulo N, computed here as lcm(p - 1, q - 1).
-    M = ((p - 1) * (q - 1)) // gcd(p - 1, q - 1)
+    M = ((p - 1) * (q - 1)) // common_divisor(p - 1, q - 1, gcd_method)
     print(f'  lambda(N) = {M}')
 
-    E = choose_exponent(M)
+    E = choose_exponent(M, gcd_method)
     D = mod_mul_inverse(E, M)
     print(f'  public exponent  E = {E}')
     print(f'  private exponent D = {D}   (D * E mod lambda = {D * E % M})')
@@ -279,7 +413,7 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
         print(f'  text    = {shown!r}')
         print(f'  UTF-8   = {data!r}')
         print(f'  hex     = {hexstr}')
-        print(f'  m (int) = {m}')
+        print_big_int('m (int)', m)
 
         print(f'\n[2b] CHARACTER BREAKDOWN   '
               f'(len {len(text)}, threshold {BREAKDOWN_THRESHOLD})')
@@ -303,7 +437,7 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
         decoded = recovered.decode('utf-8')
 
         print('\n[6] RESULT')
-        print(f'  recovered int  = {int.from_bytes(recovered, "big")}')
+        print_big_int('recovered int', int.from_bytes(recovered, 'big'))
         print(f'  recovered text = {decoded!r}')
         print(f'  matches original: {decoded == text}')
         print('=' * 60)
@@ -312,21 +446,21 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
     print('\n[2] MESSAGE -> INTEGER')
     m = message
     print('  numeric input')
-    print(f'  m = {m}')
+    print_big_int('m', m)
 
     # Block splitting. r is the remainder modulo N and is the only part that
     # is actually encrypted. n is the quotient. The third value is the fixed
-    # marker p = N - 1, so that (N - 1) ** E mod N = N - 1 for any odd E.
+    # marker b = N - 1, so that (N - 1) ** E mod N = N - 1 for any odd E.
     # This is a deliberate teaching device: the marker proves the RSA
-    # round-trip, and the reconstruction d = (p_dec + 1) * n + r_dec relies
-    # on p_dec == N - 1. It also means the high part of the message is not
+    # round-trip, and the reconstruction d = (block_dec + 1) * n + r_dec relies
+    # on block_dec == N - 1. It also means the high part of the message is not
     # really hidden, so this scheme must not be used for real secrecy.
     n = m // N
     r = m % N
     block = N - 1
 
     print('\n[3] BLOCKS')
-    print(f'  quotient  n = {n}')
+    print_big_int('quotient  n', n)
     print(f'  remainder r = {r}')
     print(f'  marker    b = N - 1 = {block}')
 
@@ -346,36 +480,14 @@ def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
     d = (block_dec + 1) * n + r_dec
 
     print('\n[6] RESULT')
-    print(f'  recovered int  = {d}')
+    print_big_int('recovered int', d)
     print(f'  matches original: {d == m}')
     print('=' * 60)
 
     return d
 
 
-def bezout_check(a, b):
-    """
-    Return the extended_gcd result plus the identity value a * x + b * y.
-
-    Used by the --check bezout helper so the Bezout identity can be shown and
-    verified without recomputing the coefficients.
-    """
-    g, x, y = extended_gcd(a, b)
-    return g, x, y, a * x + b * y
-
-
-def prime_check(n):
-    """
-    Compare the deterministic and probabilistic primality tests on n.
-
-    Returns (trial_division(n), fermat_test(n, k)). The Fermat test accepts
-    Carmichael numbers such as 561, which is exactly the contrast this helper
-    is meant to demonstrate.
-    """
-    return trial_division(n), fermat_test(n, 20)
-
-
-def run_attack(bits=6, seed=None):
+def run_attack(bits=6, seed=None, gcd_method='euclid', prime_method='trial'):
     """
     Break an RSA key by factoring N with Fermat's method.
 
@@ -393,10 +505,10 @@ def run_attack(bits=6, seed=None):
     print('  FERMAT FACTORIZATION ATTACK ON N')
     print('=' * 60)
 
-    p, q = gen_close_primes(bits)
+    p, q = gen_close_primes(bits, prime_method)
     N = p * q
-    M = ((p - 1) * (q - 1)) // gcd(p - 1, q - 1)
-    E = choose_exponent(M)
+    M = ((p - 1) * (q - 1)) // common_divisor(p - 1, q - 1, gcd_method)
+    E = choose_exponent(M, gcd_method)
 
     print('\n[1] VICTIM KEY (factors hidden in a real scenario)')
     print(f'  N = {N}')
@@ -415,7 +527,7 @@ def run_attack(bits=6, seed=None):
     print(f'  elapsed: {elapsed:.3f} s')
 
     print('\n[3] REBUILDING THE PRIVATE KEY')
-    Mr = ((fp - 1) * (fq - 1)) // gcd(fp - 1, fq - 1)
+    Mr = ((fp - 1) * (fq - 1)) // common_divisor(fp - 1, fq - 1, gcd_method)
     Dr = mod_mul_inverse(E, Mr)
     print(f'  recovered p = {fp}, q = {fq}')
     print(f'  recovered lambda(N) = {Mr}')
@@ -432,40 +544,6 @@ def run_attack(bits=6, seed=None):
     print('=' * 60)
 
     return fp, fq
-
-
-def run_check(what, a=None, b=None, n=None):
-    """Dispatch the --check helpers for sqrt, bezout and prime tests."""
-    if what == 'sqrt':
-        if a is None:
-            raise ValueError('--sqrt-number is required for --check sqrt')
-        floor = bin_sqrt(a)
-        print(f'  bin_sqrt({a}) = {floor}')
-        print(f'  floor ** 2 = {floor * floor}')
-        print(f'  ceil  = {floor + (0 if floor * floor == a else 1)}')
-        return floor
-    if what == 'bezout':
-        if a is None or b is None:
-            raise ValueError('--bezout-a and --bezout-b are required for --check bezout')
-        g, x, y, identity = bezout_check(a, b)
-        print(f'  extended_gcd({a}, {b}) = ({g}, {x}, {y})')
-        print(f'  gcd = {g}, math.gcd = {gcd(a, b)}')
-        print(f'  {a} * {x} + {b} * {y} = {identity}')
-        print(f'  identity holds: {identity == g}')
-        return g, x, y
-    if what == 'prime':
-        if n is None:
-            raise ValueError('--prime is required for --check prime')
-        deterministic, probabilistic = prime_check(n)
-        print(f'  n = {n}')
-        print(f'  trial_division (deterministic) = {deterministic}')
-        print(f'  fermat_test    (probabilistic) = {probabilistic}')
-        print(f'  agreement: {deterministic == probabilistic}')
-        if probabilistic and not deterministic:
-            print('  note: fermat_test accepted a Carmichael number; '
-                  'trial_division rejects it')
-        return deterministic, probabilistic
-    raise ValueError(f'unknown check: {what!r}')
 
 
 def main():
@@ -488,42 +566,51 @@ def main():
                         help='force a text message even when it looks numeric')
     parser.add_argument('--attack', action='store_true',
                         help='break a key by factoring N (Fermat, uses bin_sqrt)')
-    parser.add_argument('--check', choices=('sqrt', 'bezout', 'prime'),
-                        default=None, help='run a standalone math helper')
-    parser.add_argument('--sqrt-number', type=int, default=None, dest='sqrt_number',
-                        help='number for --check sqrt (uses bin_sqrt)')
-    parser.add_argument('--bezout-a', type=int, default=None, dest='bezout_a',
-                        help='first number for --check bezout (uses extended_gcd)')
-    parser.add_argument('--bezout-b', type=int, default=None, dest='bezout_b',
-                        help='second number for --check bezout (uses extended_gcd)')
-    parser.add_argument('--prime', type=int, default=None,
-                        help='number for --check prime (trial_division vs fermat_test)')
+    parser.add_argument('--gcd', choices=('euclid', 'extended'),
+                        default='euclid', dest='gcd_method',
+                        help='gcd algorithm: euclid (default) or extended '
+                             '(extended_gcd, also yields Bezout coefficients)')
+    parser.add_argument('--prime', choices=('trial', 'fermat'),
+                        default='trial', dest='prime_method',
+                        help='primality test for generating p and q: trial '
+                             '(deterministic, default) or fermat (probabilistic)')
     args = parser.parse_args()
 
-    if args.check is not None:
-        a = args.sqrt_number if args.check == 'sqrt' else args.bezout_a
+    if args.attack:
         try:
-            run_check(args.check, a=a, b=args.bezout_b, n=args.prime)
+            run_attack(bits=args.bits, seed=args.seed,
+                       gcd_method=args.gcd_method,
+                       prime_method=args.prime_method)
         except ValueError as exc:
             parser.error(str(exc))
-        return
-
-    if args.attack:
-        run_attack(bits=args.bits, seed=args.seed)
         return
 
     # Resolve the CLI message into either a numeric message (int) or text.
     if args.text is not None:
         message, text = None, args.text
     elif args.message is not None and looks_like_int(args.message):
-        message, text = int(args.message), None
+        # A decimal argument longer than the int -> str limit cannot be parsed
+        # at all (the same CPython limit blocks str -> int for base 10), so it
+        # is reported instead of raising a traceback.
+        try:
+            message, text = int(args.message), None
+        except ValueError:
+            digits = len(args.message.lstrip('+-'))
+            parser.error(
+                f'--m has {digits} digits, which exceeds the int -> str limit; '
+                'use a shorter number or pass the value as text with --text'
+            )
     elif args.message is not None:
         message, text = None, args.message
     else:
         message, text = None, None
 
-    run(p=args.p, q=args.q, bits=args.bits, seed=args.seed,
-        message=message, text=text)
+    try:
+        run(p=args.p, q=args.q, bits=args.bits, seed=args.seed,
+            message=message, text=text,
+            gcd_method=args.gcd_method, prime_method=args.prime_method)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == '__main__':
