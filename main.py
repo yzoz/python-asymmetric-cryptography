@@ -3,12 +3,14 @@ Demonstration of an educational public-key (RSA-like) cryptosystem.
 
 This module only drives the scenario: it generates primes, chooses the key
 material and prints a readable transcript. All the mathematical primitives
-live in crypto_math.py so that the algorithms stay clean and testable.
+live in crypto_math.py and every text conversion lives in crypto_text.py, so
+that the algorithms stay clean and testable.
 """
 
 import argparse
 import os
 import random
+import re
 import sys
 import time
 
@@ -20,6 +22,20 @@ from crypto_math import (
     mod_mul_inverse,
     trial_division,
     fermat_test,
+)
+from crypto_text import (
+    DEFAULT_MESSAGE,
+    COLUMNS,
+    BREAKDOWN_THRESHOLD,
+    CATEGORY_ORDER,
+    text_to_int,
+    int_to_text,
+    encoding_steps,
+    char_records,
+    char_categories,
+    block_size,
+    split_blocks,
+    join_blocks,
 )
 
 # When a seed is supplied this holds a seeded generator so the whole run is
@@ -66,6 +82,16 @@ def gen_prime(b=6, certainty=10):
         x = get_rand(b)
     print(f'  prime found in {time.time() - t:.3f} s')
     return x
+
+
+def looks_like_int(s):
+    """
+    Return True when s is an optionally signed run of decimal digits.
+
+    Used by the CLI to decide whether --m is a numeric message or a text; a
+    string such as 'hello' is text, while '-42' and '007' are numbers.
+    """
+    return re.fullmatch(r'[+-]?\d+', s) is not None
 
 
 def gen_close_primes(b=6):
@@ -138,19 +164,88 @@ def choose_exponent(m):
     return e
 
 
-def int_to_text(m):
-    """Decode a message integer back to a UTF-8 string."""
-    length = (m.bit_length() + 7) // 8
-    return m.to_bytes(length, 'big').decode('utf-8')
+def print_categories(text):
+    """
+    Print a compact one-line-per-category summary of the characters in text.
+
+    The counts make the composition of the default alphabet immediately
+    visible (26 upper, 26 lower, 10 digits and the special characters).
+    """
+    groups = char_categories(text)
+    print('  category    count  characters')
+    for name in CATEGORY_ORDER:
+        chars = groups[name]
+        if not chars:
+            continue
+        shown = ''.join(chars)
+        if len(shown) > 46:
+            shown = shown[:43] + '...'
+        print(f'  {name:<10} {len(chars):>5}  {shown}')
 
 
-def text_to_int(text):
-    """Encode a string into a single message integer."""
-    return int.from_bytes(text.encode('utf-8'), 'big')
+def print_char_table(text, columns=COLUMNS):
+    """
+    Print the per-character breakdown as a multi-column table.
+
+    Each character becomes one cell of (index, char, code point, utf-8 hex).
+    Cells are filled row by row (index 0,1,2,... then the next row), and the
+    whole table is laid out in `columns` vertical groups.
+    """
+    records = char_records(text)
+    rows = (len(records) + columns - 1) // columns
+
+    header = '  {:>2}  {}  {:<6}  {}'.format('id', 'ch', 'code', 'hex')
+    divider = '  --  --  ------  ---'
+    print('   |  '.join([header] * columns))
+    print('   |  '.join([divider] * columns))
+
+    for r in range(rows):
+        cells = []
+        for c in range(columns):
+            i = c * rows + r
+            if i < len(records):
+                index, ch, code, hexstr = records[i]
+                # A space is invisible in the table, so it is shown as the
+                # visible U+2420 symbol; every other character prints as is.
+                display = '\u2420' if ch == ' ' else ch
+                cells.append('  {:>2}  {}  {}  {}'.format(
+                    index, display, code, hexstr))
+            else:
+                cells.append(' ' * 18)
+        print('   |  '.join(cells))
 
 
-def run(p=None, q=None, bits=6, seed=None, message=None):
-    """Run one full encryption/decryption demonstration and print the result."""
+def print_blocks(blocks, E, D, N):
+    """
+    Encrypt and decrypt one list of byte blocks and print the transcript.
+
+    Returns the list of (plain_int, cipher_int, back_int) triples so the
+    caller can rebuild the message and verify the round-trip.
+    """
+    results = []
+    for i, block in enumerate(blocks):
+        plain = int.from_bytes(block, 'big')
+        cipher = mod_exp(plain, E, N)
+        back = mod_exp(cipher, D, N)
+        results.append((plain, cipher, back))
+        print(f'  block {i}: plain = {plain}')
+        print(f'           cipher = {cipher}')
+        print(f'           back   = {back}   ok: {back == plain}')
+    return results
+
+
+def run(p=None, q=None, bits=6, seed=None, message=None, text=None,
+        force_text=False):
+    """
+    Run one full encryption/decryption demonstration and print the result.
+
+    Two paths are supported:
+
+    * text path (message is None): the text is encoded as UTF-8 and encrypted
+      block by block, properly hiding every byte;
+    * numeric path (message is an int): the historical single-value scheme
+      with the fixed marker block N - 1 is kept.
+    """
     global _rng
 
     if seed is not None:
@@ -180,15 +275,46 @@ def run(p=None, q=None, bits=6, seed=None, message=None):
     print(f'  public exponent  E = {E}')
     print(f'  private exponent D = {D}   (D * E mod lambda = {D * E % M})')
 
-    print('\n[2] MESSAGE -> INTEGER')
     if message is None:
-        text = 'RSA!'
-        m = text_to_int(text)
-        print(f'  text    = {text!r}')
-    else:
-        m = message
-        text = None
-        print('  numeric input')
+        text = text if text is not None else DEFAULT_MESSAGE
+        print('\n[2] MESSAGE -> INTEGER')
+        shown, data, hexstr, m = encoding_steps(text)
+        print(f'  text    = {shown!r}')
+        print(f'  UTF-8   = {data!r}')
+        print(f'  hex     = {hexstr}')
+        print(f'  m (int) = {m}')
+
+        print(f'\n[2b] CHARACTER BREAKDOWN   '
+              f'(len {len(text)}, threshold {BREAKDOWN_THRESHOLD})')
+        if len(text) <= BREAKDOWN_THRESHOLD:
+            print_categories(text)
+            print()
+            print_char_table(text)
+        else:
+            print('  text is longer than the threshold; table skipped')
+
+        k = block_size(N)
+        blocks = split_blocks(data, k)
+        print(f'\n[3] BLOCK SPLITTING   '
+              f'(k = {k} bytes, N has {N.bit_length()} bits)')
+        results = print_blocks(blocks, E, D, N)
+
+        recovered = b''.join(
+            back.to_bytes(len(block), 'big')
+            for block, (_, _, back) in zip(blocks, results)
+        )
+        decoded = recovered.decode('utf-8')
+
+        print('\n[6] RESULT')
+        print(f'  recovered int  = {int.from_bytes(recovered, "big")}')
+        print(f'  recovered text = {decoded!r}')
+        print(f'  matches original: {decoded == text}')
+        print('=' * 60)
+        return decoded
+
+    print('\n[2] MESSAGE -> INTEGER')
+    m = message
+    print('  numeric input')
     print(f'  m = {m}')
 
     # Block splitting. r is the remainder modulo N and is the only part that
@@ -223,10 +349,8 @@ def run(p=None, q=None, bits=6, seed=None, message=None):
     d = (block_dec + 1) * n + r_dec
 
     print('\n[6] RESULT')
-    print(f'  recovered m = {d}')
+    print(f'  recovered int  = {d}')
     print(f'  matches original: {d == m}')
-    if text is not None:
-        print(f'  recovered text = {int_to_text(d)!r}')
     print('=' * 60)
 
     return d
@@ -359,8 +483,12 @@ def main():
                         help='explicit second prime (deterministic scenario)')
     parser.add_argument('--bits', type=int, default=6,
                         help='size in bytes of generated primes (default: 6)')
-    parser.add_argument('--m', type=int, default=None, dest='message',
-                        help='numeric message instead of the built-in text')
+    parser.add_argument('--m', type=str, default=None, dest='message',
+                        help='message: a number is encrypted as a number, '
+                             'anything else as UTF-8 text (default: built-in '
+                             'alphabet message)')
+    parser.add_argument('--text', type=str, default=None,
+                        help='force a text message even when it looks numeric')
     parser.add_argument('--attack', action='store_true',
                         help='break a key by factoring N (Fermat, uses bin_sqrt)')
     parser.add_argument('--check', choices=('sqrt', 'bezout', 'prime'),
@@ -387,7 +515,18 @@ def main():
         run_attack(bits=args.bits, seed=args.seed)
         return
 
-    run(p=args.p, q=args.q, bits=args.bits, seed=args.seed, message=args.message)
+    # Resolve the CLI message into either a numeric message (int) or text.
+    if args.text is not None:
+        message, text = None, args.text
+    elif args.message is not None and looks_like_int(args.message):
+        message, text = int(args.message), None
+    elif args.message is not None:
+        message, text = None, args.message
+    else:
+        message, text = None, None
+
+    run(p=args.p, q=args.q, bits=args.bits, seed=args.seed,
+        message=message, text=text)
 
 
 if __name__ == '__main__':

@@ -1,107 +1,21 @@
 """
-Tests for the educational cryptography project.
+Tests for the scenario code in main.py.
 
-Runs on the standard unittest module only, no third-party dependencies.
-The mathematical primitives live in crypto_math and are checked against
-Python's built-in equivalents; the end-to-end RSA round-trip is checked on
-fixed parameters so the numbers stay deterministic.
+Runs on the standard unittest module only. The pure primitives are covered by
+test_math.py and test_crypto_text.py; here we check the pieces that live in
+main: the Fermat attack, the CLI helpers, the block round-trip and the two
+output paths (text vs numeric).
 """
 
+import io
 import math
 import random
 import unittest
+from contextlib import redirect_stdout
 
 import crypto_math as cm
+import crypto_text as ct
 import main
-
-
-class TestModExp(unittest.TestCase):
-    def test_matches_builtin_pow(self):
-        cases = [
-            (2, 10, 1000), (3, 5, 7), (123456, 789, 10 ** 9 + 7),
-            (5, 0, 13), (0, 5, 7), (7, 1, 11), (65537, 12345, 99991),
-        ]
-        for x, y, z in cases:
-            with self.subTest(x=x, y=y, z=z):
-                self.assertEqual(cm.mod_exp(x, y, z), pow(x, y, z))
-
-
-class TestGcd(unittest.TestCase):
-    def test_matches_math_gcd(self):
-        cases = [(0, 5), (5, 0), (12, 18), (17, 5), (270, 192), (1, 1)]
-        for a, b in cases:
-            with self.subTest(a=a, b=b):
-                self.assertEqual(cm.gcd(a, b), math.gcd(a, b))
-
-
-class TestExtendedGcd(unittest.TestCase):
-    def test_bezout_identity(self):
-        cases = [(240, 46), (61 * 19, 53 * 19), (17, 3120), (3, 8), (1, 1)]
-        for a, b in cases:
-            with self.subTest(a=a, b=b):
-                g, x, y = cm.extended_gcd(a, b)
-                self.assertEqual(g, math.gcd(a, b))
-                self.assertEqual(a * x + b * y, g)
-
-
-class TestModMulInverse(unittest.TestCase):
-    def test_inverse(self):
-        cases = [(17, 3120), (3, 40), (7, 26), (65537, 103 * 97)]
-        for a, b in cases:
-            with self.subTest(a=a, b=b):
-                self.assertEqual((cm.mod_mul_inverse(a, b) * a) % b, 1)
-
-
-class TestBinSqrt(unittest.TestCase):
-    def test_matches_isqrt(self):
-        for x in [0, 1, 2, 3, 4, 8, 9, 10, 15, 16, 17, 99, 100, 10 ** 12]:
-            with self.subTest(x=x):
-                self.assertEqual(cm.bin_sqrt(x), math.isqrt(x))
-
-    def test_zero(self):
-        self.assertEqual(cm.bin_sqrt(0), 0)
-
-
-class TestTrialDivision(unittest.TestCase):
-    def test_perfect_squares_are_composite(self):
-        # Regression: 9, 15 and 25 used to be reported as prime because the
-        # upper bound of the divisor range excluded sqrt(x).
-        for x in (9, 15, 25):
-            with self.subTest(x=x):
-                self.assertFalse(cm.trial_division(x))
-
-    def test_small_numbers(self):
-        for x in (0, 1):
-            with self.subTest(x=x):
-                self.assertFalse(cm.trial_division(x))
-        self.assertTrue(cm.trial_division(2))
-        self.assertFalse(cm.trial_division(4))
-
-    def test_primes_and_composites(self):
-        for x in (7, 13, 97, 101, 9973):
-            with self.subTest(x=x):
-                self.assertTrue(cm.trial_division(x))
-        for x in (21, 49, 91, 1000, 9975):
-            with self.subTest(x=x):
-                self.assertFalse(cm.trial_division(x))
-
-    def test_against_isqrt_range(self):
-        for x in range(2, 500):
-            with self.subTest(x=x):
-                self.assertEqual(cm.trial_division(x), all(x % d for d in range(2, math.isqrt(x) + 1)))
-
-
-class TestFermatTest(unittest.TestCase):
-    def test_primes_pass(self):
-        for x in (3, 5, 7, 13, 97, 101):
-            with self.subTest(x=x):
-                self.assertTrue(cm.fermat_test(x, 20))
-
-    def test_carmichael_limitation(self):
-        # 561 is a Carmichael number: the Fermat test cannot reject it, which
-        # is exactly the documented limitation. trial_division must reject it.
-        self.assertTrue(cm.fermat_test(561, 20))
-        self.assertFalse(cm.trial_division(561))
 
 
 class TestRoundTrip(unittest.TestCase):
@@ -211,20 +125,70 @@ class TestChooseExponent(unittest.TestCase):
         self.assertEqual(math.gcd(3, 40), 1)
 
 
-class TestTextEncoding(unittest.TestCase):
-    def test_roundtrip(self):
-        for text in ('RSA!', 'hello', 'Привет', 'x'):
-            with self.subTest(text=text):
-                self.assertEqual(main.int_to_text(main.text_to_int(text)), text)
+class TestLooksLikeInt(unittest.TestCase):
+    def test_numbers(self):
+        for s in ('0', '42', '007', '-13', '+7'):
+            with self.subTest(s=s):
+                self.assertTrue(main.looks_like_int(s))
+
+    def test_non_numbers(self):
+        for s in ('', 'hello', '12a', '3.14', '1 2', 'A1'):
+            with self.subTest(s=s):
+                self.assertFalse(main.looks_like_int(s))
 
 
-class TestNoSideEffects(unittest.TestCase):
-    def test_crypto_math_has_no_io(self):
-        with open('crypto_math.py', encoding='utf-8') as fh:
-            source = fh.read()
-        for forbidden in ('print(', 'import random', 'random.', 'os.urandom', 'import os'):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, source)
+class TestRunPaths(unittest.TestCase):
+    """run() prints a transcript; capture it and check the two code paths."""
+
+    P, Q = 61, 53  # N = 3233, so the block size is 1 byte.
+
+    def _run(self, **kwargs):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = main.run(p=self.P, q=self.Q, **kwargs)
+        return result, buf.getvalue()
+
+    def test_text_path_round_trip(self):
+        text = 'Hello, World! 123'
+        result, out = self._run(text=text)
+        self.assertEqual(result, text)
+        self.assertIn('recovered int', out)
+        self.assertIn('recovered text', out)
+        self.assertNotIn('recovered m', out)
+
+    def test_text_path_long_message(self):
+        # Longer than one modulus, so it must be split into many blocks.
+        text = ct.DEFAULT_MESSAGE * 3
+        result, out = self._run(text=text)
+        self.assertEqual(result, text)
+        self.assertIn('BLOCK SPLITTING', out)
+        self.assertIn('block 0:', out)
+
+    def test_text_path_character_breakdown_shown(self):
+        _, out = self._run(text='AB!')
+        self.assertIn('CHARACTER BREAKDOWN', out)
+        self.assertIn('U+0041', out)
+
+    def test_text_path_breakdown_skipped_when_long(self):
+        text = 'a' * (ct.BREAKDOWN_THRESHOLD + 1)
+        _, out = self._run(text=text)
+        self.assertIn('CHARACTER BREAKDOWN', out)
+        self.assertIn('table skipped', out)
+
+    def test_default_message(self):
+        result, out = self._run()
+        self.assertEqual(result, ct.DEFAULT_MESSAGE)
+        self.assertIn('recovered text', out)
+
+    def test_numeric_path_has_no_recovered_text(self):
+        result, out = self._run(message=12345)
+        self.assertEqual(result, 12345)
+        self.assertIn('recovered int', out)
+        self.assertNotIn('recovered text', out)
+
+    def test_numeric_path_keeps_marker(self):
+        _, out = self._run(message=12345)
+        self.assertIn('marker', out)
 
 
 if __name__ == '__main__':
